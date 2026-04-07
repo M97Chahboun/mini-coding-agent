@@ -1,35 +1,41 @@
+```gitignore
 # Python
 __pycache__/
-*.py[cod]
+*.pyc
 *.pyo
 *.pyd
 
-# Virtual environments
+# Logs and temp files
+*.log
+*.tmp
+*.swp
+
+# Environment
+.env
+.env.local
+*.env.*
+
+# Editors
+.vscode/
+.idea/
+
+# Dependencies
 .venv/
 venv/
-uv.lock
+node_modules/
 
-# Packaging
-*.egg-info/
-build/
+# Build artifacts
 dist/
+build/
+target/
+*.egg-info/
 
-# Test and lint caches
-.pytest_cache/
-.ruff_cache/
+# Coverage
 .coverage
+coverage/
 htmlcov/
 
-# Temporary files
-.mini-coding-agent
-*.tmp
-*.temp
-*.swp
-*.swo
-*~
-
-# Local scratch space
-tmp/
-
-# OS files
-.DS_Store
+# Testing
+.pytest_cache/
+.mypy_cache/
+```

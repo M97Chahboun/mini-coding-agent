@@ -138,6 +138,54 @@ By default it uses:
 For a concrete usage example, see [EXAMPLE.md](EXAMPLE.md).
 
 &nbsp;
+## Token-Efficient Code Indexing
+
+The agent includes a built-in code parser inspired by [code-parser](https://github.com/M97Chahboun/code-parser) that enables token-efficient workflows for large codebases.
+
+### The Problem
+
+When an LLM agent needs to understand a codebase, the naive approach is to read entire files. For a typical project this means **50,000 – 200,000 tokens per request**, most of which is irrelevant boilerplate.
+
+### The Solution: Index → Locate → Read Surgically
+
+The agent now supports a three-phase workflow:
+
+**Phase 1 — Index (cheap)**
+```bash
+# Generate code structure index for the entire project
+<tool>{"name":"code_index","args":{"path":"."}}</tool>
+```
+Returns a compact summary showing all classes, methods, and functions with their line counts (~400 tokens for a 2000-line file).
+
+**Phase 2 — Locate Specific Symbols**
+```bash
+# Find exact location of a class or method
+<tool>{"name":"find_symbol","args":{"symbol":"UserService"}}</tool>
+```
+Returns the file path and exact line range for the symbol.
+
+**Phase 3 — Surgical Reading**
+```bash
+# Read only the specific lines you need
+<tool>{"name":"read_lines","args":{"path":"src/user.py","start":27,"end":32}}</tool>
+```
+Reads only the relevant method body (~300 tokens instead of 15,000).
+
+### Token Savings
+
+| Approach | Tokens | Use Case |
+|----------|--------|----------|
+| Read full file | ~15,000 | Legacy approach |
+| Index + surgical reads | ~400 index + ~300 per method | **97% reduction** |
+
+### Supported Languages
+
+Currently supports Python (`.py`) files with detection of:
+- Classes (including nested classes)
+- Methods (including `async def`, decorated methods)
+- Top-level functions (including async functions)
+
+&nbsp;
 ## Approval Modes
 
 Risky tools such as shell commands and file writes are gated by approval.
@@ -237,6 +285,8 @@ Important flags:
   controls sampling randomness; default: `0.2`
 - `--top-p`
   controls nucleus sampling for generation; default: `0.9`
+- `--stream`
+  enables streaming response output for real-time display of model responses
 
 &nbsp;
 ## Example

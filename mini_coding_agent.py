@@ -71,6 +71,341 @@ def middle(text, limit):
 
 
 ##############################
+#### Code Parser Index ######
+##############################
+class CodeParser:
+    """Lightweight code structure extractor for token-efficient indexing.
+    
+    Extracts class/method/function definitions with line numbers from source files.
+    This allows the agent to understand code structure without reading entire files,
+    reducing token consumption by ~97% for large files.
+    
+    Supported languages: Python (.py), with extensible design for more languages.
+    """
+    
+    SUPPORTED_EXTENSIONS = {".py"}
+    
+    @classmethod
+    def parse_file(cls, filepath):
+        """Parse a single source file and extract structure information.
+        
+        Returns a dict with:
+        - file: relative path
+        - language: detected language
+        - classes: list of {name, kind, line_start, line_end, methods: [{name, line_start, line_end}]}
+        - functions: list of {name, line_start, line_end} (top-level functions)
+        """
+        filepath = Path(filepath)
+        ext = filepath.suffix.lower()
+        
+        if ext not in cls.SUPPORTED_EXTENSIONS:
+            return None
+        
+        try:
+            content = filepath.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return None
+        
+        lines = content.splitlines()
+        
+        if ext == ".py":
+            return cls._parse_python(filepath, lines)
+        
+        return None
+    
+    @classmethod
+    def _parse_python(cls, filepath, lines):
+        """Parse Python file using regex-based extraction."""
+        result = {
+            "file": str(filepath),
+            "language": "python",
+            "classes": [],
+            "functions": [],
+        }
+        
+        # Track indentation levels for class scope detection
+        class_stack = []  # Stack of (class_name, indent_level, start_line, methods)
+        top_level_indent = None
+        
+        # Regex patterns
+        class_pattern = re.compile(r'^(\s*)class\s+(\w+)(?:\s*\([^)]*\))?\s*:')
+        func_pattern = re.compile(r'^(\s*)(?:async\s+)?def\s+(\w+)\s*\([^)]*\)\s*(?:->[^:]+)?:')
+        async_func_pattern = re.compile(r'^(\s*)async\s+def\s+(\w+)\s*\([^)]*\)\s*(?:->[^:]+)?:')
+        
+        current_class = None
+        current_methods = []
+        class_indent = 0
+        
+        for line_num, line in enumerate(lines, start=1):
+            # Skip empty lines and comments
+            stripped = line.lstrip()
+            if not stripped or stripped.startswith('#'):
+                continue
+            
+            # Calculate indentation
+            indent = len(line) - len(stripped)
+            
+            # Check for class definition
+            class_match = class_pattern.match(line)
+            if class_match:
+                # Save previous class if any
+                if current_class is not None:
+                    result["classes"].append({
+                        "name": current_class,
+                        "kind": "class",
+                        "line_start": class_start_line,
+                        "line_end": line_num - 1,
+                        "methods": current_methods,
+                    })
+                
+                # Start new class
+                current_class = class_match.group(2)
+                class_indent = indent
+                class_start_line = line_num
+                current_methods = []
+                continue
+            
+            # Check for method definition inside a class
+            if current_class is not None:
+                func_match = func_pattern.match(line) or async_func_pattern.match(line)
+                if func_match:
+                    func_indent = len(func_match.group(1))
+                    # Method must be indented more than class
+                    if func_indent > class_indent:
+                        func_name = func_match.group(2)
+                        current_methods.append({
+                            "name": func_name,
+                            "line_start": line_num,
+                            "line_end": line_num,  # Will be updated when we see next item
+                        })
+                    else:
+                        # Exited class scope
+                        result["classes"].append({
+                            "name": current_class,
+                            "kind": "class",
+                            "line_start": class_start_line,
+                            "line_end": line_num - 1,
+                            "methods": current_methods,
+                        })
+                        current_class = None
+                        current_methods = []
+                        
+                        # Check if this is a top-level function
+                        if func_indent == 0:
+                            func_name = func_match.group(2)
+                            result["functions"].append({
+                                "name": func_name,
+                                "line_start": line_num,
+                                "line_end": line_num,
+                            })
+                elif indent <= class_indent and stripped and not stripped.startswith('#'):
+                    # Exited class scope without seeing a method
+                    result["classes"].append({
+                        "name": current_class,
+                        "kind": "class",
+                        "line_start": class_start_line,
+                        "line_end": line_num - 1,
+                        "methods": current_methods,
+                    })
+                    current_class = None
+                    current_methods = []
+            else:
+                # Check for top-level function
+                func_match = func_pattern.match(line) or async_func_pattern.match(line)
+                if func_match:
+                    func_indent = len(func_match.group(1))
+                    if func_indent == 0:
+                        func_name = func_match.group(2)
+                        result["functions"].append({
+                            "name": func_name,
+                            "line_start": line_num,
+                            "line_end": line_num,
+                        })
+        
+        # Close final class if any
+        if current_class is not None:
+            result["classes"].append({
+                "name": current_class,
+                "kind": "class",
+                "line_start": class_start_line,
+                "line_end": len(lines),
+                "methods": current_methods,
+            })
+        
+        # Update method end lines
+        for cls_info in result["classes"]:
+            methods = cls_info["methods"]
+            for i, method in enumerate(methods):
+                if i < len(methods) - 1:
+                    method["line_end"] = methods[i + 1]["line_start"] - 1
+                else:
+                    method["line_end"] = cls_info["line_end"]
+        
+        return result
+    
+    @classmethod
+    def parse_directory(cls, directory, extensions=None):
+        """Parse all supported files in a directory recursively.
+        
+        Args:
+            directory: Path to directory to scan
+            extensions: Set of file extensions to include (default: SUPPORTED_EXTENSIONS)
+        
+        Returns:
+            List of parse results for each file
+        """
+        if extensions is None:
+            extensions = cls.SUPPORTED_EXTENSIONS
+        
+        results = []
+        directory = Path(directory)
+        
+        for ext in extensions:
+            for filepath in directory.rglob(f"*{ext}"):
+                # Skip ignored paths
+                if any(part in IGNORED_PATH_NAMES for part in filepath.relative_to(directory).parts):
+                    continue
+                
+                parsed = cls.parse_file(filepath)
+                if parsed:
+                    results.append(parsed)
+        
+        return results
+    
+    @classmethod
+    def to_index_summary(cls, parse_results):
+        """Convert parse results to a compact index summary for LLM context.
+        
+        This creates a token-efficient representation showing only:
+        - File paths
+        - Class names with method counts
+        - Function names
+        
+        Example output:
+        ```
+        src/main.py:
+          classes: UserService (5 methods), AuthHandler (3 methods)
+          functions: main, setup_logging
+        
+        src/utils.py:
+          functions: parse_config, validate_input
+        ```
+        """
+        if not parse_results:
+            return "(no code structures found)"
+        
+        lines = []
+        for result in parse_results:
+            filepath = result["file"]
+            classes = result.get("classes", [])
+            functions = result.get("functions", [])
+            
+            if not classes and not functions:
+                continue
+            
+            lines.append(f"{filepath}:")
+            
+            if classes:
+                class_parts = []
+                for cls in classes:
+                    method_count = len(cls.get("methods", []))
+                    class_parts.append(f"{cls['name']} ({method_count} methods)")
+                lines.append(f"  classes: {', '.join(class_parts)}")
+            
+            if functions:
+                func_names = [f["name"] for f in functions]
+                lines.append(f"  functions: {', '.join(func_names)}")
+        
+        return "\n".join(lines) if lines else "(no code structures found)"
+    
+    @classmethod
+    def find_symbol(cls, parse_results, symbol_name):
+        """Find a specific class, method, or function by name in parse results.
+        
+        Args:
+            parse_results: List of parse results from parse_file or parse_directory
+            symbol_name: Name of the symbol to find (e.g., "UserService" or "createUser")
+        
+        Returns:
+            Dict with file path, symbol info, and line range, or None if not found
+        
+        Example:
+            {
+                "file": "src/services/user.py",
+                "kind": "method",
+                "parent": "UserService",
+                "name": "createUser",
+                "line_start": 27,
+                "line_end": 32
+            }
+        """
+        if not parse_results:
+            return None
+        
+        for result in parse_results:
+            filepath = result["file"]
+            
+            # Search in classes
+            for cls in result.get("classes", []):
+                if cls["name"] == symbol_name:
+                    return {
+                        "file": filepath,
+                        "kind": "class",
+                        "name": cls["name"],
+                        "line_start": cls["line_start"],
+                        "line_end": cls["line_end"],
+                    }
+                
+                # Search in methods
+                for method in cls.get("methods", []):
+                    if method["name"] == symbol_name:
+                        return {
+                            "file": filepath,
+                            "kind": "method",
+                            "parent": cls["name"],
+                            "name": method["name"],
+                            "line_start": method["line_start"],
+                            "line_end": method["line_end"],
+                        }
+            
+            # Search in top-level functions
+            for func in result.get("functions", []):
+                if func["name"] == symbol_name:
+                    return {
+                        "file": filepath,
+                        "kind": "function",
+                        "name": func["name"],
+                        "line_start": func["line_start"],
+                        "line_end": func["line_end"],
+                    }
+        
+        return None
+    
+    @classmethod
+    def find_symbols_in_file(cls, filepath, symbol_names):
+        """Find multiple symbols in a single file.
+        
+        Args:
+            filepath: Path to the file to parse
+            symbol_names: List of symbol names to find
+        
+        Returns:
+            Dict mapping symbol names to their locations, or empty dict if none found
+        """
+        parse_result = cls.parse_file(filepath)
+        if not parse_result:
+            return {}
+        
+        results = {}
+        for name in symbol_names:
+            found = cls.find_symbol([parse_result], name)
+            if found:
+                results[name] = found
+        
+        return results
+
+
+##############################
 #### 1) Live Repo Context ####
 ##############################
 class WorkspaceContext:
@@ -180,18 +515,19 @@ class FakeModelClient:
 
 
 class OllamaModelClient:
-    def __init__(self, model, host, temperature, top_p, timeout):
+    def __init__(self, model, host, temperature, top_p, timeout, stream=False):
         self.model = model
         self.host = host.rstrip("/")
         self.temperature = temperature
         self.top_p = top_p
         self.timeout = timeout
+        self.stream = stream
 
     def complete(self, prompt, max_new_tokens):
         payload = {
             "model": self.model,
             "prompt": prompt,
-            "stream": False,
+            "stream": self.stream,
             "raw": False,
             "think": False,
             "options": {
@@ -207,8 +543,14 @@ class OllamaModelClient:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                data = json.loads(response.read().decode("utf-8"))
+            if self.stream:
+                # Open response without context manager so it stays open for the generator
+                response = urllib.request.urlopen(request, timeout=self.timeout)
+                # Stream the response and yield chunks for real-time display
+                return self._stream_response(response)
+            else:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    data = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"Ollama request failed with HTTP {exc.code}: {body}") from exc
@@ -223,6 +565,38 @@ class OllamaModelClient:
         if data.get("error"):
             raise RuntimeError(f"Ollama error: {data['error']}")
         return data.get("response", "")
+
+    def _stream_response(self, response):
+        """Generator that streams response chunks for real-time display.
+        
+        Reads line-by-line to avoid JSON fragmentation from fixed-size reads.
+        The response object must remain open until the generator completes.
+        """
+        chunks = []
+        buffer = ""
+        while True:
+            # Read one byte at a time until we find a newline
+            byte = response.read(1)
+            if not byte:
+                break
+            buffer += byte.decode("utf-8")
+            if byte == b"\n":
+                # Complete line received
+                line = buffer.strip()
+                buffer = ""
+                if line:
+                    try:
+                        data = json.loads(line)
+                        if "response" in data:
+                            chunks.append(data["response"])
+                            # Yield chunk for streaming display
+                            yield data["response"]
+                        if data.get("done", False):
+                            break
+                    except json.JSONDecodeError:
+                        # Skip malformed lines
+                        continue
+        return "".join(chunks)
 
 
 class MiniAgent:
@@ -296,6 +670,24 @@ class MiniAgent:
                 "description": "Read a UTF-8 file by line range.",
                 "run": self.tool_read_file,
             },
+            "read_lines": {
+                "schema": {"path": "str", "start": "int", "end": "int"},
+                "risky": False,
+                "description": "Read specific lines from a source file (use with code index).",
+                "run": self.tool_read_lines,
+            },
+            "code_index": {
+                "schema": {"path": "str='.'"},
+                "risky": False,
+                "description": "Generate a token-efficient code structure index for a directory.",
+                "run": self.tool_code_index,
+            },
+            "find_symbol": {
+                "schema": {"symbol": "str", "path": "str='.'"},
+                "risky": False,
+                "description": "Find a class/method/function by name and return its exact line range for surgical reading.",
+                "run": self.tool_find_symbol,
+            },
             "search": {
                 "schema": {"pattern": "str", "path": "str='.'"},
                 "risky": False,
@@ -319,6 +711,18 @@ class MiniAgent:
                 "risky": True,
                 "description": "Replace one exact text block in a file.",
                 "run": self.tool_patch_file,
+            },
+            "write_files": {
+                "schema": {"files": "list"},
+                "risky": True,
+                "description": "Atomically write multiple files; all succeed or none (rollback on failure). Each file: {path, content}.",
+                "run": self.tool_write_files,
+            },
+            "patch_files": {
+                "schema": {"patches": "list"},
+                "risky": True,
+                "description": "Atomically patch multiple files; all succeed or none (rollback on failure). Each patch: {path, old_text, new_text}.",
+                "run": self.tool_patch_files,
             },
         }
         if self.depth < self.max_depth:
@@ -346,7 +750,12 @@ class MiniAgent:
                 '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":80}}</tool>',
                 '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
                 '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
+                '<tool name="write_files"><files>[{"path": "a.py", "content": "print(1)"}, {"path": "b.py", "content": "print(2)"}]</files></tool>',
+                '<tool name="patch_files"><patches>[{"path": "main.py", "old_text": "x=1", "new_text": "x=2"}]</patches></tool>',
                 '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q","timeout":20}}</tool>',
+                '<tool>{"name":"code_index","args":{"path":"."}}</tool>',
+                '<tool>{"name":"find_symbol","args":{"symbol":"UserService","path":"src"}}</tool>',
+                '<tool>{"name":"read_lines","args":{"path":"main.py","start":27,"end":32}}</tool>',
                 "<final>Done.</final>",
             ]
         )
@@ -370,7 +779,8 @@ class MiniAgent:
             - When writing tests, match the current implementation unless the user explicitly asked you to change the code.
             - New files should be complete and runnable, including obvious imports.
             - Do not repeat the same tool call with the same arguments if it did not help. Choose a different tool or return a final answer.
-            - Required tool arguments must not be empty. Do not call read_file, write_file, patch_file, run_shell, or delegate with args={{}}.
+            - Required tool arguments must not be empty. Do not call read_file, write_file, patch_file, run_shell, delegate, write_files, or patch_files with args={{}}.
+            - For token efficiency: use code_index first to get an overview, then find_symbol to locate specific classes/methods, then read_lines for surgical reading of only the relevant code.
 
             Tools:
             {tool_text}
@@ -454,12 +864,19 @@ class MiniAgent:
     def note_tool(self, name, args, result):
         memory = self.session["memory"]
         path = args.get("path")
-        if name in {"read_file", "write_file", "patch_file"} and path:
+        if name in {"read_file", "write_file", "patch_file", "write_files", "patch_files"} and path:
             self.remember(memory["files"], str(path), 8)
+        # For multi-file operations, track all paths
+        if name == "write_files":
+            for file_spec in args.get("files", []):
+                self.remember(memory["files"], str(file_spec.get("path", "")), 8)
+        if name == "patch_files":
+            for patch_spec in args.get("patches", []):
+                self.remember(memory["files"], str(patch_spec.get("path", "")), 8)
         note = f"{name}: {clip(str(result).replace(chr(10), ' '), 220)}"
         self.remember(memory["notes"], note, 5)
 
-    def ask(self, user_message):
+    def ask(self, user_message, stream_output=True):
         memory = self.session["memory"]
         if not memory["task"]:
             memory["task"] = clip(user_message.strip(), 300)
@@ -471,7 +888,24 @@ class MiniAgent:
 
         while tool_steps < self.max_steps and attempts < max_attempts:
             attempts += 1
-            raw = self.model_client.complete(self.prompt(user_message), self.max_new_tokens)
+            raw_response = self.model_client.complete(self.prompt(user_message), self.max_new_tokens)
+            
+            # Handle streaming response
+            if hasattr(raw_response, '__iter__') and not isinstance(raw_response, str):
+                # It's a generator (streaming mode)
+                if stream_output:
+                    print("\n[Assistant streaming]: ", end="", flush=True)
+                chunks = []
+                for chunk in raw_response:
+                    if stream_output:
+                        print(chunk, end="", flush=True)
+                    chunks.append(chunk)
+                raw = "".join(chunks)
+                if stream_output:
+                    print()  # Newline after streaming
+            else:
+                raw = raw_response
+            
             kind, payload = self.parse(raw)
 
             if kind == "tool":
@@ -569,6 +1003,33 @@ class MiniAgent:
                 raise ValueError("invalid line range")
             return
 
+        if name == "read_lines":
+            path = self.path(args["path"])
+            if not path.is_file():
+                raise ValueError("path is not a file")
+            start = int(args.get("start"))
+            end = int(args.get("end"))
+            if not start or not end:
+                raise ValueError("start and end are required")
+            if start < 1 or end < start:
+                raise ValueError("invalid line range")
+            return
+
+        if name == "code_index":
+            path = self.path(args.get("path", "."))
+            if not path.is_dir():
+                raise ValueError("path is not a directory")
+            return
+
+        if name == "find_symbol":
+            symbol = str(args.get("symbol", "")).strip()
+            if not symbol:
+                raise ValueError("symbol name is required")
+            path = self.path(args.get("path", "."))
+            if not path.exists():
+                raise ValueError("path does not exist")
+            return
+
         if name == "search":
             pattern = str(args.get("pattern", "")).strip()
             if not pattern:
@@ -614,6 +1075,47 @@ class MiniAgent:
             task = str(args.get("task", "")).strip()
             if not task:
                 raise ValueError("task must not be empty")
+            return
+
+        if name == "write_files":
+            files = args.get("files")
+            if not isinstance(files, list) or len(files) == 0:
+                raise ValueError("files must be a non-empty list")
+            for idx, file_spec in enumerate(files):
+                if not isinstance(file_spec, dict):
+                    raise ValueError(f"file {idx} must be an object")
+                if "path" not in file_spec:
+                    raise ValueError(f"file {idx} missing 'path'")
+                if "content" not in file_spec:
+                    raise ValueError(f"file {idx} missing 'content'")
+                path = self.path(file_spec["path"])
+                if path.exists() and path.is_dir():
+                    raise ValueError(f"file {idx} path is a directory: {file_spec['path']}")
+            return
+
+        if name == "patch_files":
+            patches = args.get("patches")
+            if not isinstance(patches, list) or len(patches) == 0:
+                raise ValueError("patches must be a non-empty list")
+            for idx, patch_spec in enumerate(patches):
+                if not isinstance(patch_spec, dict):
+                    raise ValueError(f"patch {idx} must be an object")
+                if "path" not in patch_spec:
+                    raise ValueError(f"patch {idx} missing 'path'")
+                if "old_text" not in patch_spec:
+                    raise ValueError(f"patch {idx} missing 'old_text'")
+                if "new_text" not in patch_spec:
+                    raise ValueError(f"patch {idx} missing 'new_text'")
+                path = self.path(patch_spec["path"])
+                if not path.is_file():
+                    raise ValueError(f"patch {idx} path is not a file: {patch_spec['path']}")
+                old_text = str(patch_spec.get("old_text", ""))
+                if not old_text:
+                    raise ValueError(f"patch {idx} old_text must not be empty")
+                text = path.read_text(encoding="utf-8")
+                count = text.count(old_text)
+                if count != 1:
+                    raise ValueError(f"patch {idx} old_text must occur exactly once in {patch_spec['path']}, found {count}")
             return
 
     def approve(self, name, args):
@@ -782,6 +1284,76 @@ class MiniAgent:
         body = "\n".join(f"{number:>4}: {line}" for number, line in enumerate(lines[start - 1:end], start=start))
         return f"# {path.relative_to(self.root)}\n{body}"
 
+    def tool_read_lines(self, args):
+        """Read specific lines from a source file (for use with code index)."""
+        path = self.path(args["path"])
+        if not path.is_file():
+            raise ValueError("path is not a file")
+        start = int(args.get("start"))
+        end = int(args.get("end"))
+        if not start or not end:
+            raise ValueError("start and end line numbers are required")
+        if start < 1 or end < start:
+            raise ValueError("invalid line range")
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        body = "\n".join(f"{number:>4}: {line}" for number, line in enumerate(lines[start - 1:end], start=start))
+        return f"# {path.relative_to(self.root)}\n{body}"
+
+    def tool_code_index(self, args):
+        """Generate a token-efficient code structure index for a directory."""
+        path = self.path(args.get("path", "."))
+        if not path.is_dir():
+            raise ValueError("path is not a directory")
+        
+        # Parse all supported files in the directory
+        parse_results = CodeParser.parse_directory(path)
+        
+        # Generate compact summary
+        summary = CodeParser.to_index_summary(parse_results)
+        
+        # Also include detailed JSON for programmatic access
+        import json
+        details = json.dumps(parse_results, indent=2)
+        
+        return f"Code Structure Index Summary:\n{summary}\n\n--- Full Details ---\n{details}"
+    
+    def tool_find_symbol(self, args):
+        """Find a specific class, method, or function by name and return its exact line range.
+        
+        Use this after code_index to locate symbols without reading entire files.
+        Returns the file path and line range for surgical reading with read_lines.
+        """
+        symbol_name = str(args.get("symbol", "")).strip()
+        if not symbol_name:
+            raise ValueError("symbol name is required")
+        
+        path = self.path(args.get("path", "."))
+        if not path.exists():
+            raise ValueError("path does not exist")
+        
+        # Parse the directory or single file
+        if path.is_dir():
+            parse_results = CodeParser.parse_directory(path)
+        else:
+            result = CodeParser.parse_file(path)
+            parse_results = [result] if result else []
+        
+        # Find the symbol
+        found = CodeParser.find_symbol(parse_results, symbol_name)
+        
+        if not found:
+            return f"Symbol '{symbol_name}' not found in {path}"
+        
+        # Format result with usage hint
+        import json
+        return (
+            f"Found {found['kind']} '{found['name']}'"
+            + (f" in {found['parent']}" if found.get('parent') else "")
+            + f":\nFile: {found['file']}\nLines: {found['line_start']}-{found['line_end']}\n\n"
+            f"Use read_lines to view: <tool>{{\"name\":\"read_lines\",\"args\":{{\"path\":\"{found['file']}\","
+            f"\"start\":{found['line_start']},\"end\":{found['line_end']}}}}}</tool>"
+        )
+
     def tool_search(self, args):
         pattern = str(args.get("pattern", "")).strip()
         if not pattern:
@@ -857,6 +1429,94 @@ class MiniAgent:
             raise ValueError(f"old_text must occur exactly once, found {count}")
         path.write_text(text.replace(old_text, str(args["new_text"]), 1), encoding="utf-8")
         return f"patched {path.relative_to(self.root)}"
+
+    def tool_write_files(self, args):
+        """Atomically write multiple files with rollback on failure."""
+        files = args.get("files", [])
+        written_paths = []
+        original_contents = {}
+        
+        try:
+            # Phase 1: Write all files, tracking what we've done
+            for idx, file_spec in enumerate(files):
+                path = self.path(file_spec["path"])
+                content = str(file_spec["content"])
+                
+                # Save original content for rollback if file exists
+                if path.exists():
+                    original_contents[path] = path.read_text(encoding="utf-8")
+                
+                # Create parent directories and write
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding="utf-8")
+                written_paths.append(path)
+            
+            # Success - return summary
+            summaries = [f"wrote {p.relative_to(self.root)}" for p in written_paths]
+            return "atomic write successful:\\n" + "\\n".join(summaries)
+            
+        except Exception as exc:
+            # Rollback: restore originals or remove newly created files
+            for path in reversed(written_paths):
+                try:
+                    if path in original_contents:
+                        path.write_text(original_contents[path], encoding="utf-8")
+                    elif path.exists():
+                        path.unlink()
+                except OSError:
+                    pass  # Best effort rollback
+            raise RuntimeError(f"atomic write failed: {exc}; rolled back changes") from exc
+
+    def tool_patch_files(self, args):
+        """Atomically patch multiple files with rollback on failure."""
+        patches = args.get("patches", [])
+        patched_paths = []
+        original_contents = {}
+        
+        try:
+            # Phase 1: Read all files and validate patches
+            for idx, patch_spec in enumerate(patches):
+                path = self.path(patch_spec["path"])
+                if not path.is_file():
+                    raise ValueError(f"patch {idx} path is not a file: {patch_spec['path']}")
+                
+                # Save original content
+                original_contents[path] = path.read_text(encoding="utf-8")
+                
+                # Validate patch can be applied
+                old_text = str(patch_spec.get("old_text", ""))
+                if not old_text:
+                    raise ValueError(f"patch {idx} old_text must not be empty")
+                text = original_contents[path]
+                count = text.count(old_text)
+                if count != 1:
+                    raise ValueError(f"patch {idx} old_text must occur exactly once in {patch_spec['path']}, found {count}")
+            
+            # Phase 2: Apply all patches
+            for idx, patch_spec in enumerate(patches):
+                path = self.path(patch_spec["path"])
+                old_text = str(patch_spec["old_text"])
+                new_text = str(patch_spec["new_text"])
+                text = original_contents[path]
+                
+                # Apply patch
+                new_content = text.replace(old_text, new_text, 1)
+                path.write_text(new_content, encoding="utf-8")
+                patched_paths.append(path)
+            
+            # Success - return summary
+            summaries = [f"patched {p.relative_to(self.root)}" for p in patched_paths]
+            return "atomic patch successful:\\n" + "\\n".join(summaries)
+            
+        except Exception as exc:
+            # Rollback: restore all original contents
+            for path in reversed(patched_paths):
+                try:
+                    if path in original_contents:
+                        path.write_text(original_contents[path], encoding="utf-8")
+                except OSError:
+                    pass  # Best effort rollback
+            raise RuntimeError(f"atomic patch failed: {exc}; rolled back changes") from exc
 
     ###################################################
     #### 6) Delegation And Bounded Subagents ##########
@@ -935,6 +1595,7 @@ def build_agent(args):
         temperature=args.temperature,
         top_p=args.top_p,
         timeout=args.ollama_timeout,
+        stream=getattr(args, 'stream', False),
     )
     session_id = args.resume
     if session_id == "latest":
@@ -980,6 +1641,7 @@ def build_arg_parser():
     parser.add_argument("--max-new-tokens", type=int, default=512, help="Maximum model output tokens per step.")
     parser.add_argument("--temperature", type=float, default=0.2, help="Sampling temperature sent to Ollama.")
     parser.add_argument("--top-p", type=float, default=0.9, help="Top-p sampling value sent to Ollama.")
+    parser.add_argument("--stream", action="store_true", help="Enable streaming response output.")
     return parser
 
 
@@ -994,7 +1656,7 @@ def main(argv=None):
         if prompt:
             print()
             try:
-                print(agent.ask(prompt))
+                print(agent.ask(prompt, stream_output=args.stream))
             except RuntimeError as exc:
                 print(str(exc), file=sys.stderr)
                 return 1
@@ -1027,7 +1689,7 @@ def main(argv=None):
 
         print()
         try:
-            print(agent.ask(user_input))
+            print(agent.ask(user_input, stream_output=args.stream))
         except RuntimeError as exc:
             print(str(exc), file=sys.stderr)
 

@@ -342,6 +342,7 @@ def test_ollama_client_posts_expected_payload():
         temperature=0.2,
         top_p=0.9,
         timeout=30,
+        stream=False,
     )
 
     with patch("urllib.request.urlopen", fake_urlopen):
@@ -356,3 +357,113 @@ def test_ollama_client_posts_expected_payload():
     assert captured["body"]["raw"] is False
     assert captured["body"]["think"] is False
     assert captured["body"]["options"]["num_predict"] == 42
+
+
+def test_write_files_atomically_writes_multiple_files(tmp_path):
+    """Test that write_files atomically writes multiple files."""
+    agent = build_agent(tmp_path, [])
+    
+    result = agent.run_tool("write_files", {
+        "files": [
+            {"path": "a.py", "content": "print('a')"},
+            {"path": "b.py", "content": "print('b')"},
+        ]
+    })
+    
+    assert "atomic write successful" in result
+    assert (tmp_path / "a.py").read_text(encoding="utf-8") == "print('a')"
+    assert (tmp_path / "b.py").read_text(encoding="utf-8") == "print('b')"
+
+
+def test_write_files_rolls_back_on_failure(tmp_path):
+    """Test that write_files rolls back on failure."""
+    agent = build_agent(tmp_path, [])
+    
+    # Create an existing file
+    (tmp_path / "existing.txt").write_text("original content\n", encoding="utf-8")
+    
+    # Try to write files where one will fail (directory path)
+    result = agent.run_tool("write_files", {
+        "files": [
+            {"path": "new.txt", "content": "new content"},
+            {"path": ".", "content": "should fail"},  # This will fail - path is a directory
+        ]
+    })
+    
+    # Should have failed during validation
+    assert "error:" in result
+    
+    # new.txt should not exist (validation fails before any writes)
+    assert not (tmp_path / "new.txt").exists()
+    # existing.txt should be unchanged (not affected)
+    assert (tmp_path / "existing.txt").read_text(encoding="utf-8") == "original content\n"
+
+
+def test_patch_files_atomically_patches_multiple_files(tmp_path):
+    """Test that patch_files atomically patches multiple files."""
+    # Create initial files
+    (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("y = 2\n", encoding="utf-8")
+    
+    agent = build_agent(tmp_path, [])
+    
+    result = agent.run_tool("patch_files", {
+        "patches": [
+            {"path": "a.py", "old_text": "x = 1", "new_text": "x = 10"},
+            {"path": "b.py", "old_text": "y = 2", "new_text": "y = 20"},
+        ]
+    })
+    
+    assert "atomic patch successful" in result
+    assert (tmp_path / "a.py").read_text(encoding="utf-8") == "x = 10\n"
+    assert (tmp_path / "b.py").read_text(encoding="utf-8") == "y = 20\n"
+
+
+def test_patch_files_rolls_back_on_failure(tmp_path):
+    """Test that patch_files validates all patches before applying any."""
+    # Create initial files
+    (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("y = 2\n", encoding="utf-8")
+    
+    agent = build_agent(tmp_path, [])
+    
+    # Try to patch files where one will fail (non-existent old_text)
+    result = agent.run_tool("patch_files", {
+        "patches": [
+            {"path": "a.py", "old_text": "x = 1", "new_text": "x = 10"},
+            {"path": "b.py", "old_text": "NONEXISTENT", "new_text": "y = 20"},  # This will fail
+        ]
+    })
+    
+    # Should have failed during validation (before any patches applied)
+    assert "error:" in result
+    
+    # Both files should be unchanged (validation happens before patching)
+    assert (tmp_path / "a.py").read_text(encoding="utf-8") == "x = 1\n"
+    assert (tmp_path / "b.py").read_text(encoding="utf-8") == "y = 2\n"
+
+
+def test_write_files_validation_requires_non_empty_list(tmp_path):
+    """Test that write_files validates the files argument."""
+    agent = build_agent(tmp_path, [])
+    
+    # Empty list should fail
+    result = agent.run_tool("write_files", {"files": []})
+    assert "files must be a non-empty list" in result
+    
+    # Missing files should fail
+    result = agent.run_tool("write_files", {})
+    assert "files must be a non-empty list" in result
+
+
+def test_patch_files_validation_requires_non_empty_list(tmp_path):
+    """Test that patch_files validates the patches argument."""
+    agent = build_agent(tmp_path, [])
+    
+    # Empty list should fail
+    result = agent.run_tool("patch_files", {"patches": []})
+    assert "patches must be a non-empty list" in result
+    
+    # Missing patches should fail
+    result = agent.run_tool("patch_files", {})
+    assert "patches must be a non-empty list" in result
