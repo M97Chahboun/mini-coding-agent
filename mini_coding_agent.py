@@ -180,18 +180,19 @@ class FakeModelClient:
 
 
 class OllamaModelClient:
-    def __init__(self, model, host, temperature, top_p, timeout):
+    def __init__(self, model, host, temperature, top_p, timeout, stream=False):
         self.model = model
         self.host = host.rstrip("/")
         self.temperature = temperature
         self.top_p = top_p
         self.timeout = timeout
+        self.stream = stream
 
     def complete(self, prompt, max_new_tokens):
         payload = {
             "model": self.model,
             "prompt": prompt,
-            "stream": False,
+            "stream": self.stream,
             "raw": False,
             "think": False,
             "options": {
@@ -208,7 +209,11 @@ class OllamaModelClient:
         )
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                data = json.loads(response.read().decode("utf-8"))
+                if self.stream:
+                    # Stream the response and yield chunks for real-time display
+                    return self._stream_response(response)
+                else:
+                    data = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"Ollama request failed with HTTP {exc.code}: {body}") from exc
@@ -223,6 +228,24 @@ class OllamaModelClient:
         if data.get("error"):
             raise RuntimeError(f"Ollama error: {data['error']}")
         return data.get("response", "")
+
+    def _stream_response(self, response):
+        """Generator that streams response chunks for real-time display."""
+        chunks = []
+        while True:
+            chunk = response.read(4096)
+            if not chunk:
+                break
+            for line in chunk.decode("utf-8").splitlines():
+                if line.strip():
+                    data = json.loads(line)
+                    if "response" in data:
+                        chunks.append(data["response"])
+                        # Yield chunk for streaming display
+                        yield data["response"]
+                    if data.get("done", False):
+                        break
+        return "".join(chunks)
 
 
 class MiniAgent:
@@ -459,7 +482,7 @@ class MiniAgent:
         note = f"{name}: {clip(str(result).replace(chr(10), ' '), 220)}"
         self.remember(memory["notes"], note, 5)
 
-    def ask(self, user_message):
+    def ask(self, user_message, stream_output=True):
         memory = self.session["memory"]
         if not memory["task"]:
             memory["task"] = clip(user_message.strip(), 300)
@@ -471,7 +494,24 @@ class MiniAgent:
 
         while tool_steps < self.max_steps and attempts < max_attempts:
             attempts += 1
-            raw = self.model_client.complete(self.prompt(user_message), self.max_new_tokens)
+            raw_response = self.model_client.complete(self.prompt(user_message), self.max_new_tokens)
+            
+            # Handle streaming response
+            if hasattr(raw_response, '__iter__') and not isinstance(raw_response, str):
+                # It's a generator (streaming mode)
+                if stream_output:
+                    print("\n[Assistant streaming]: ", end="", flush=True)
+                chunks = []
+                for chunk in raw_response:
+                    if stream_output:
+                        print(chunk, end="", flush=True)
+                    chunks.append(chunk)
+                raw = "".join(chunks)
+                if stream_output:
+                    print()  # Newline after streaming
+            else:
+                raw = raw_response
+            
             kind, payload = self.parse(raw)
 
             if kind == "tool":
@@ -935,6 +975,7 @@ def build_agent(args):
         temperature=args.temperature,
         top_p=args.top_p,
         timeout=args.ollama_timeout,
+        stream=getattr(args, 'stream', False),
     )
     session_id = args.resume
     if session_id == "latest":
@@ -980,6 +1021,7 @@ def build_arg_parser():
     parser.add_argument("--max-new-tokens", type=int, default=512, help="Maximum model output tokens per step.")
     parser.add_argument("--temperature", type=float, default=0.2, help="Sampling temperature sent to Ollama.")
     parser.add_argument("--top-p", type=float, default=0.9, help="Top-p sampling value sent to Ollama.")
+    parser.add_argument("--stream", action="store_true", help="Enable streaming response output.")
     return parser
 
 
@@ -994,7 +1036,7 @@ def main(argv=None):
         if prompt:
             print()
             try:
-                print(agent.ask(prompt))
+                print(agent.ask(prompt, stream_output=args.stream))
             except RuntimeError as exc:
                 print(str(exc), file=sys.stderr)
                 return 1
@@ -1027,7 +1069,7 @@ def main(argv=None):
 
         print()
         try:
-            print(agent.ask(user_input))
+            print(agent.ask(user_input, stream_output=args.stream))
         except RuntimeError as exc:
             print(str(exc), file=sys.stderr)
 

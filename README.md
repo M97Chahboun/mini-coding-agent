@@ -237,6 +237,8 @@ Important flags:
   controls sampling randomness; default: `0.2`
 - `--top-p`
   controls nucleus sampling for generation; default: `0.9`
+- `--stream`
+  enables streaming response output for real-time display of model responses
 
 &nbsp;
 ## Example

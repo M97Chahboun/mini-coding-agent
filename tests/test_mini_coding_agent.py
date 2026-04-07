@@ -342,6 +342,7 @@ def test_ollama_client_posts_expected_payload():
         temperature=0.2,
         top_p=0.9,
         timeout=30,
+        stream=False,
     )
 
     with patch("urllib.request.urlopen", fake_urlopen):
