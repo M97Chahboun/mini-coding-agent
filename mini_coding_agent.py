@@ -1005,6 +1005,15 @@ class MiniAgent:
                 raise ValueError("path is not a directory")
             return
 
+        if name == "find_symbol":
+            symbol = str(args.get("symbol", "")).strip()
+            if not symbol:
+                raise ValueError("symbol name is required")
+            path = self.path(args.get("path", "."))
+            if not path.exists():
+                raise ValueError("path does not exist")
+            return
+
         if name == "search":
             pattern = str(args.get("pattern", "")).strip()
             if not pattern:
