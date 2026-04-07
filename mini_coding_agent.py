@@ -343,6 +343,18 @@ class MiniAgent:
                 "description": "Replace one exact text block in a file.",
                 "run": self.tool_patch_file,
             },
+            "write_files": {
+                "schema": {"files": "list"},
+                "risky": True,
+                "description": "Atomically write multiple files; all succeed or none (rollback on failure). Each file: {path, content}.",
+                "run": self.tool_write_files,
+            },
+            "patch_files": {
+                "schema": {"patches": "list"},
+                "risky": True,
+                "description": "Atomically patch multiple files; all succeed or none (rollback on failure). Each patch: {path, old_text, new_text}.",
+                "run": self.tool_patch_files,
+            },
         }
         if self.depth < self.max_depth:
             tools["delegate"] = {
@@ -369,6 +381,8 @@ class MiniAgent:
                 '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":80}}</tool>',
                 '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
                 '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
+                '<tool name="write_files"><files>[{"path": "a.py", "content": "print(1)"}, {"path": "b.py", "content": "print(2)"}]</files></tool>',
+                '<tool name="patch_files"><patches>[{"path": "main.py", "old_text": "x=1", "new_text": "x=2"}]</patches></tool>',
                 '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q","timeout":20}}</tool>',
                 "<final>Done.</final>",
             ]
@@ -393,7 +407,7 @@ class MiniAgent:
             - When writing tests, match the current implementation unless the user explicitly asked you to change the code.
             - New files should be complete and runnable, including obvious imports.
             - Do not repeat the same tool call with the same arguments if it did not help. Choose a different tool or return a final answer.
-            - Required tool arguments must not be empty. Do not call read_file, write_file, patch_file, run_shell, or delegate with args={{}}.
+            - Required tool arguments must not be empty. Do not call read_file, write_file, patch_file, run_shell, delegate, write_files, or patch_files with args={{}}.
 
             Tools:
             {tool_text}
@@ -477,8 +491,15 @@ class MiniAgent:
     def note_tool(self, name, args, result):
         memory = self.session["memory"]
         path = args.get("path")
-        if name in {"read_file", "write_file", "patch_file"} and path:
+        if name in {"read_file", "write_file", "patch_file", "write_files", "patch_files"} and path:
             self.remember(memory["files"], str(path), 8)
+        # For multi-file operations, track all paths
+        if name == "write_files":
+            for file_spec in args.get("files", []):
+                self.remember(memory["files"], str(file_spec.get("path", "")), 8)
+        if name == "patch_files":
+            for patch_spec in args.get("patches", []):
+                self.remember(memory["files"], str(patch_spec.get("path", "")), 8)
         note = f"{name}: {clip(str(result).replace(chr(10), ' '), 220)}"
         self.remember(memory["notes"], note, 5)
 
@@ -654,6 +675,47 @@ class MiniAgent:
             task = str(args.get("task", "")).strip()
             if not task:
                 raise ValueError("task must not be empty")
+            return
+
+        if name == "write_files":
+            files = args.get("files")
+            if not isinstance(files, list) or len(files) == 0:
+                raise ValueError("files must be a non-empty list")
+            for idx, file_spec in enumerate(files):
+                if not isinstance(file_spec, dict):
+                    raise ValueError(f"file {idx} must be an object")
+                if "path" not in file_spec:
+                    raise ValueError(f"file {idx} missing 'path'")
+                if "content" not in file_spec:
+                    raise ValueError(f"file {idx} missing 'content'")
+                path = self.path(file_spec["path"])
+                if path.exists() and path.is_dir():
+                    raise ValueError(f"file {idx} path is a directory: {file_spec['path']}")
+            return
+
+        if name == "patch_files":
+            patches = args.get("patches")
+            if not isinstance(patches, list) or len(patches) == 0:
+                raise ValueError("patches must be a non-empty list")
+            for idx, patch_spec in enumerate(patches):
+                if not isinstance(patch_spec, dict):
+                    raise ValueError(f"patch {idx} must be an object")
+                if "path" not in patch_spec:
+                    raise ValueError(f"patch {idx} missing 'path'")
+                if "old_text" not in patch_spec:
+                    raise ValueError(f"patch {idx} missing 'old_text'")
+                if "new_text" not in patch_spec:
+                    raise ValueError(f"patch {idx} missing 'new_text'")
+                path = self.path(patch_spec["path"])
+                if not path.is_file():
+                    raise ValueError(f"patch {idx} path is not a file: {patch_spec['path']}")
+                old_text = str(patch_spec.get("old_text", ""))
+                if not old_text:
+                    raise ValueError(f"patch {idx} old_text must not be empty")
+                text = path.read_text(encoding="utf-8")
+                count = text.count(old_text)
+                if count != 1:
+                    raise ValueError(f"patch {idx} old_text must occur exactly once in {patch_spec['path']}, found {count}")
             return
 
     def approve(self, name, args):
@@ -897,6 +959,94 @@ class MiniAgent:
             raise ValueError(f"old_text must occur exactly once, found {count}")
         path.write_text(text.replace(old_text, str(args["new_text"]), 1), encoding="utf-8")
         return f"patched {path.relative_to(self.root)}"
+
+    def tool_write_files(self, args):
+        """Atomically write multiple files with rollback on failure."""
+        files = args.get("files", [])
+        written_paths = []
+        original_contents = {}
+        
+        try:
+            # Phase 1: Write all files, tracking what we've done
+            for idx, file_spec in enumerate(files):
+                path = self.path(file_spec["path"])
+                content = str(file_spec["content"])
+                
+                # Save original content for rollback if file exists
+                if path.exists():
+                    original_contents[path] = path.read_text(encoding="utf-8")
+                
+                # Create parent directories and write
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding="utf-8")
+                written_paths.append(path)
+            
+            # Success - return summary
+            summaries = [f"wrote {p.relative_to(self.root)}" for p in written_paths]
+            return "atomic write successful:\\n" + "\\n".join(summaries)
+            
+        except Exception as exc:
+            # Rollback: restore originals or remove newly created files
+            for path in reversed(written_paths):
+                try:
+                    if path in original_contents:
+                        path.write_text(original_contents[path], encoding="utf-8")
+                    elif path.exists():
+                        path.unlink()
+                except OSError:
+                    pass  # Best effort rollback
+            raise RuntimeError(f"atomic write failed: {exc}; rolled back changes") from exc
+
+    def tool_patch_files(self, args):
+        """Atomically patch multiple files with rollback on failure."""
+        patches = args.get("patches", [])
+        patched_paths = []
+        original_contents = {}
+        
+        try:
+            # Phase 1: Read all files and validate patches
+            for idx, patch_spec in enumerate(patches):
+                path = self.path(patch_spec["path"])
+                if not path.is_file():
+                    raise ValueError(f"patch {idx} path is not a file: {patch_spec['path']}")
+                
+                # Save original content
+                original_contents[path] = path.read_text(encoding="utf-8")
+                
+                # Validate patch can be applied
+                old_text = str(patch_spec.get("old_text", ""))
+                if not old_text:
+                    raise ValueError(f"patch {idx} old_text must not be empty")
+                text = original_contents[path]
+                count = text.count(old_text)
+                if count != 1:
+                    raise ValueError(f"patch {idx} old_text must occur exactly once in {patch_spec['path']}, found {count}")
+            
+            # Phase 2: Apply all patches
+            for idx, patch_spec in enumerate(patches):
+                path = self.path(patch_spec["path"])
+                old_text = str(patch_spec["old_text"])
+                new_text = str(patch_spec["new_text"])
+                text = original_contents[path]
+                
+                # Apply patch
+                new_content = text.replace(old_text, new_text, 1)
+                path.write_text(new_content, encoding="utf-8")
+                patched_paths.append(path)
+            
+            # Success - return summary
+            summaries = [f"patched {p.relative_to(self.root)}" for p in patched_paths]
+            return "atomic patch successful:\\n" + "\\n".join(summaries)
+            
+        except Exception as exc:
+            # Rollback: restore all original contents
+            for path in reversed(patched_paths):
+                try:
+                    if path in original_contents:
+                        path.write_text(original_contents[path], encoding="utf-8")
+                except OSError:
+                    pass  # Best effort rollback
+            raise RuntimeError(f"atomic patch failed: {exc}; rolled back changes") from exc
 
     ###################################################
     #### 6) Delegation And Bounded Subagents ##########
