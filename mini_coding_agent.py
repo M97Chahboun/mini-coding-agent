@@ -543,11 +543,13 @@ class OllamaModelClient:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                if self.stream:
-                    # Stream the response and yield chunks for real-time display
-                    return self._stream_response(response)
-                else:
+            if self.stream:
+                # Open response without context manager so it stays open for the generator
+                response = urllib.request.urlopen(request, timeout=self.timeout)
+                # Stream the response and yield chunks for real-time display
+                return self._stream_response(response)
+            else:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
                     data = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
@@ -565,21 +567,35 @@ class OllamaModelClient:
         return data.get("response", "")
 
     def _stream_response(self, response):
-        """Generator that streams response chunks for real-time display."""
+        """Generator that streams response chunks for real-time display.
+        
+        Reads line-by-line to avoid JSON fragmentation from fixed-size reads.
+        The response object must remain open until the generator completes.
+        """
         chunks = []
+        buffer = ""
         while True:
-            chunk = response.read(4096)
-            if not chunk:
+            # Read one byte at a time until we find a newline
+            byte = response.read(1)
+            if not byte:
                 break
-            for line in chunk.decode("utf-8").splitlines():
-                if line.strip():
-                    data = json.loads(line)
-                    if "response" in data:
-                        chunks.append(data["response"])
-                        # Yield chunk for streaming display
-                        yield data["response"]
-                    if data.get("done", False):
-                        break
+            buffer += byte.decode("utf-8")
+            if byte == b"\n":
+                # Complete line received
+                line = buffer.strip()
+                buffer = ""
+                if line:
+                    try:
+                        data = json.loads(line)
+                        if "response" in data:
+                            chunks.append(data["response"])
+                            # Yield chunk for streaming display
+                            yield data["response"]
+                        if data.get("done", False):
+                            break
+                    except json.JSONDecodeError:
+                        # Skip malformed lines
+                        continue
         return "".join(chunks)
 
 
