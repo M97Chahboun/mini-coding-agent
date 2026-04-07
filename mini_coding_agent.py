@@ -317,6 +317,92 @@ class CodeParser:
                 lines.append(f"  functions: {', '.join(func_names)}")
         
         return "\n".join(lines) if lines else "(no code structures found)"
+    
+    @classmethod
+    def find_symbol(cls, parse_results, symbol_name):
+        """Find a specific class, method, or function by name in parse results.
+        
+        Args:
+            parse_results: List of parse results from parse_file or parse_directory
+            symbol_name: Name of the symbol to find (e.g., "UserService" or "createUser")
+        
+        Returns:
+            Dict with file path, symbol info, and line range, or None if not found
+        
+        Example:
+            {
+                "file": "src/services/user.py",
+                "kind": "method",
+                "parent": "UserService",
+                "name": "createUser",
+                "line_start": 27,
+                "line_end": 32
+            }
+        """
+        if not parse_results:
+            return None
+        
+        for result in parse_results:
+            filepath = result["file"]
+            
+            # Search in classes
+            for cls in result.get("classes", []):
+                if cls["name"] == symbol_name:
+                    return {
+                        "file": filepath,
+                        "kind": "class",
+                        "name": cls["name"],
+                        "line_start": cls["line_start"],
+                        "line_end": cls["line_end"],
+                    }
+                
+                # Search in methods
+                for method in cls.get("methods", []):
+                    if method["name"] == symbol_name:
+                        return {
+                            "file": filepath,
+                            "kind": "method",
+                            "parent": cls["name"],
+                            "name": method["name"],
+                            "line_start": method["line_start"],
+                            "line_end": method["line_end"],
+                        }
+            
+            # Search in top-level functions
+            for func in result.get("functions", []):
+                if func["name"] == symbol_name:
+                    return {
+                        "file": filepath,
+                        "kind": "function",
+                        "name": func["name"],
+                        "line_start": func["line_start"],
+                        "line_end": func["line_end"],
+                    }
+        
+        return None
+    
+    @classmethod
+    def find_symbols_in_file(cls, filepath, symbol_names):
+        """Find multiple symbols in a single file.
+        
+        Args:
+            filepath: Path to the file to parse
+            symbol_names: List of symbol names to find
+        
+        Returns:
+            Dict mapping symbol names to their locations, or empty dict if none found
+        """
+        parse_result = cls.parse_file(filepath)
+        if not parse_result:
+            return {}
+        
+        results = {}
+        for name in symbol_names:
+            found = cls.find_symbol([parse_result], name)
+            if found:
+                results[name] = found
+        
+        return results
 
 
 ##############################
@@ -580,6 +666,12 @@ class MiniAgent:
                 "description": "Generate a token-efficient code structure index for a directory.",
                 "run": self.tool_code_index,
             },
+            "find_symbol": {
+                "schema": {"symbol": "str", "path": "str='.'"},
+                "risky": False,
+                "description": "Find a class/method/function by name and return its exact line range for surgical reading.",
+                "run": self.tool_find_symbol,
+            },
             "search": {
                 "schema": {"pattern": "str", "path": "str='.'"},
                 "risky": False,
@@ -646,6 +738,7 @@ class MiniAgent:
                 '<tool name="patch_files"><patches>[{"path": "main.py", "old_text": "x=1", "new_text": "x=2"}]</patches></tool>',
                 '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q","timeout":20}}</tool>',
                 '<tool>{"name":"code_index","args":{"path":"."}}</tool>',
+                '<tool>{"name":"find_symbol","args":{"symbol":"UserService","path":"src"}}</tool>',
                 '<tool>{"name":"read_lines","args":{"path":"main.py","start":27,"end":32}}</tool>',
                 "<final>Done.</final>",
             ]
@@ -671,6 +764,7 @@ class MiniAgent:
             - New files should be complete and runnable, including obvious imports.
             - Do not repeat the same tool call with the same arguments if it did not help. Choose a different tool or return a final answer.
             - Required tool arguments must not be empty. Do not call read_file, write_file, patch_file, run_shell, delegate, write_files, or patch_files with args={{}}.
+            - For token efficiency: use code_index first to get an overview, then find_symbol to locate specific classes/methods, then read_lines for surgical reading of only the relevant code.
 
             Tools:
             {tool_text}
@@ -1197,6 +1291,43 @@ class MiniAgent:
         details = json.dumps(parse_results, indent=2)
         
         return f"Code Structure Index Summary:\n{summary}\n\n--- Full Details ---\n{details}"
+    
+    def tool_find_symbol(self, args):
+        """Find a specific class, method, or function by name and return its exact line range.
+        
+        Use this after code_index to locate symbols without reading entire files.
+        Returns the file path and line range for surgical reading with read_lines.
+        """
+        symbol_name = str(args.get("symbol", "")).strip()
+        if not symbol_name:
+            raise ValueError("symbol name is required")
+        
+        path = self.path(args.get("path", "."))
+        if not path.exists():
+            raise ValueError("path does not exist")
+        
+        # Parse the directory or single file
+        if path.is_dir():
+            parse_results = CodeParser.parse_directory(path)
+        else:
+            result = CodeParser.parse_file(path)
+            parse_results = [result] if result else []
+        
+        # Find the symbol
+        found = CodeParser.find_symbol(parse_results, symbol_name)
+        
+        if not found:
+            return f"Symbol '{symbol_name}' not found in {path}"
+        
+        # Format result with usage hint
+        import json
+        return (
+            f"Found {found['kind']} '{found['name']}'"
+            + (f" in {found['parent']}" if found.get('parent') else "")
+            + f":\nFile: {found['file']}\nLines: {found['line_start']}-{found['line_end']}\n\n"
+            f"Use read_lines to view: <tool>{{\"name\":\"read_lines\",\"args\":{{\"path\":\"{found['file']}\","
+            f"\"start\":{found['line_start']},\"end\":{found['line_end']}}}}}</tool>"
+        )
 
     def tool_search(self, args):
         pattern = str(args.get("pattern", "")).strip()
